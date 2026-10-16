@@ -18,6 +18,7 @@ AnyPS5 is not an emulator. Its relinker rewrites a PS5 executable into a native 
 - **Automatic SELF unwrapping**: `eboot.bin`, `sce_module/`, Unity `Media/Plugins` and `Media/Modules`, and any other folder with modules. Encrypted files are detected and reported.
 - **Automatic downloads**: fetches the relinker and system libraries from the AnyPS5 GitHub release (latest or a chosen version) and caches them.
 - **No 25 GB copies**: on the same OS, `app0/` is built from hard links and junctions/symlinks to the original files. Choose copy mode to move the game to another machine or OS.
+- **Patches (game updates)**: select a decrypted patch folder and it is layered on top of the base game. Patch files override base files, everything else is linked from the base dump, and nothing is copied or modified.
 - **Safe rebuilds**: converting again into the same folder rebuilds the program and keeps save data (`_sd`, `data`) and the shader cache.
 
 ## Requirements
@@ -43,6 +44,7 @@ python anyps5_converter.py <game folder | eboot.bin> [options]
 
 | Option | Description |
 |---|---|
+| `--patch DIR` | Decrypted game update (patch) folder to layer on top of the base game |
 | `-o, --output DIR` | Output folder (default `<game folder>_<os>`) |
 | `--os windows\|linux\|macos` | Target OS (default: this computer) |
 | `--cpu auto\|amd\|intel\|rosetta` | Target CPU: `amd` keeps the code as is, `intel` adds `--to-intel`, `rosetta` is for Apple Silicon (macOS only) |
@@ -61,7 +63,19 @@ Examples:
 python anyps5_converter.py D:\PS5\PPSA12345                        # Windows build for this PC
 python anyps5_converter.py D:\PS5\PPSA12345 --os linux -o E:\game  # Linux build (files copied)
 python anyps5_converter.py ~/games/PPSA12345 --cpu amd --run
+python anyps5_converter.py D:\PS5\PPSA12345 --patch D:\PS5\PPSA12345-patch   # base game + update
 ```
+
+## Patches and DLC
+
+**Patches** are supported. AnyPS5 only reads the game from `app0`, so the update has to be merged with the base game. Select the patch folder in the **Patch** field (or pass `--patch`) and the tool does the merge for you:
+
+- Files in the patch replace the same files in the base game. This includes `eboot.bin`, `sce_module/`, plugins and `sce_sys/param.json`.
+- Files only in the base game or only in the patch are both kept.
+- The patch must be a **decrypted** dump, like the base game. Many dumpers can also dump base + patch already merged; in that case just select that folder as the game.
+- The tool checks that the patch's `titleId` matches the game (override with `--force`) and logs both versions (`contentVersion`).
+
+**DLC (add-on content)** is not supported yet. AnyPS5's `libSceAppContent` currently reports no add-on content for every entitlement, so games cannot mount or see DLC ([libSceAppContent debt](https://github.com/boykopovar/AnyPS5/blob/main/docs/dev/debt/libSceAppContent.md)).
 
 ## Output layout
 
@@ -76,7 +90,7 @@ Start the program from its folder. On Linux, if you get a `/dev/udmabuf` error, 
 
 ## How it works
 
-1. Finds `eboot.bin` and every folder with `.prx`/`.sprx` modules. `sce_sys/` and `fakelib/` are skipped because AnyPS5 provides those libraries.
+1. Layers the patch (if any) over the base game, then finds `eboot.bin` and every folder with `.prx`/`.sprx` modules. `sce_sys/` and `fakelib/` are skipped because AnyPS5 provides those libraries.
 2. Unwraps SELF/fSELF containers into clean ELF files with [`unwrap_self.py`](unwrap_self.py) from AnyPS5.
 3. Downloads `relinker` and `prx-<os>` for the chosen release into `cache/`.
 4. Builds `app0/`, then runs the relinker with `--windows`/`--macos`, `--to-intel`/`--to-rosetta` and one `--module-dir` per module folder.

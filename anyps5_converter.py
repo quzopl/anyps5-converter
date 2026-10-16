@@ -32,7 +32,7 @@ sys.path.insert(0, str(TOOL_DIR))
 import unwrap_self  # noqa: E402
 
 REPO = "boykopovar/AnyPS5"
-VERSION = "1.0"
+VERSION = "1.1"
 SELF_MAGICS = (b"\x4f\x15\x3d\x1d", b"\x54\x14\xf5\xee")
 ELF_MAGIC = b"\x7fELF"
 MODULE_EXTS = {".prx", ".sprx"}
@@ -54,6 +54,7 @@ class ConvertError(Exception):
 class Config:
     game: str
     output: str = ""
+    patch: str = ""
     target_os: str = ""
     cpu: str = "auto"
     version: str = "latest"
@@ -223,41 +224,51 @@ class Converter:
             raise ConvertError(f"{eboot.name} is neither an ELF nor a SELF file (wrong file or an encrypted PKG).")
         return eboot.resolve(), root.resolve()
 
-    def read_title(self, root):
-        param = root / "sce_sys" / "param.json"
+    def locate_patch(self):
+        if not self.c.patch:
+            return None
+        patch = Path(self.c.patch).expanduser()
+        if not patch.exists():
+            raise ConvertError(f"Patch folder does not exist: {patch}")
+        if patch.is_file():
+            patch = patch.parent
+        return patch.resolve()
+
+    def read_param(self, folder):
+        """Return (titleId, titleName, contentVersion) from sce_sys/param.json, or Nones."""
+        param = folder / "sce_sys" / "param.json"
         if not param.is_file():
-            self.log("WARNING: sce_sys/param.json is missing - some games need it at startup.")
-            return None, None
+            return None, None, None
         try:
             data = json.loads(param.read_text(encoding="utf-8-sig"))
-            title_id = data.get("titleId")
             localized = data.get("localizedParameters", {})
             lang = localized.get("defaultLanguage", "en-US")
             name = (localized.get(lang) or {}).get("titleName")
             if not name:
                 name = next((v.get("titleName") for v in localized.values() if isinstance(v, dict) and v.get("titleName")), None)
-            return title_id, name
+            return data.get("titleId"), name, data.get("contentVersion")
         except (ValueError, AttributeError) as error:
-            self.log(f"WARNING: cannot read param.json: {error}")
-            return None, None
+            self.log(f"WARNING: cannot read {param}: {error}")
+            return None, None, None
 
-    def scan(self, root, eboot):
-        """Return (module directories {rel: [files]}, extra executables [rel])."""
-        modules, executables = {}, []
-        for dirpath, dirnames, filenames in os.walk(root):
-            rel = Path(dirpath).relative_to(root)
-            dirnames[:] = sorted(d for d in dirnames if d.lower() not in SKIP_DIRS and not d.startswith(".anyps5"))
-            found = []
-            for name in sorted(filenames):
-                full = Path(dirpath) / name
-                suffix = full.suffix.lower()
-                if suffix in MODULE_EXTS and magic_of(full):
-                    found.append(name)
-                elif suffix == ".bin" and full.resolve() != eboot and magic_of(full):
-                    executables.append((rel / name).as_posix())
-            if found:
-                modules[rel.as_posix()] = found
-        return modules, executables
+    def scan(self, layers, eboot_name):
+        """Scan the game layers (base first, patch last; later layers win).
+
+        Return (module directories {rel: {file: source path}}, extra executables {rel: source path}).
+        """
+        modules, executables = {}, {}
+        for layer in layers:
+            for dirpath, dirnames, filenames in os.walk(layer):
+                rel = Path(dirpath).relative_to(layer)
+                dirnames[:] = sorted(d for d in dirnames if d.lower() not in SKIP_DIRS and not d.startswith(".anyps5"))
+                for name in sorted(filenames):
+                    full = Path(dirpath) / name
+                    suffix = full.suffix.lower()
+                    if suffix in MODULE_EXTS and magic_of(full):
+                        modules.setdefault(rel.as_posix(), {})[name] = full
+                    elif suffix == ".bin" and (rel / name) != Path(eboot_name) and magic_of(full):
+                        executables[(rel / name).as_posix()] = full
+        return dict(sorted(modules.items())), executables
 
     # ---- downloads
 
@@ -401,7 +412,8 @@ class Converter:
             self.copied_fallback = True
             self.log("WARNING: linking is not possible here (other drive/no permission) - some files are copied.")
 
-    def build_app0(self, root, app0, modules, mode):
+    def build_app0(self, layers, app0, modules, mode):
+        """Mirror the layers into app0; a later layer (the patch) overrides files of earlier ones."""
         module_dirs = {Path(rel) for rel in modules}
         module_files = {Path(rel) / name for rel, names in modules.items() for name in names}
 
@@ -410,25 +422,32 @@ class Converter:
 
         count = 0
 
-        def mirror(source_dir, rel):
+        def mirror(rel):
             nonlocal count
             (app0 / rel).mkdir(parents=True, exist_ok=True)
-            for entry in sorted(os.scandir(source_dir), key=lambda e: e.name):
-                item = rel / entry.name
-                if rel == Path(".") and entry.name.startswith(".anyps5"):
-                    continue
-                if entry.is_dir():
-                    if needs_real(item) and not is_link(entry.path):
-                        mirror(entry.path, item)
+            entries = {}
+            for layer in layers:
+                folder = layer / rel
+                if folder.is_dir():
+                    for entry in os.scandir(folder):
+                        if rel == Path(".") and entry.name.startswith(".anyps5"):
+                            continue
+                        entries.setdefault(entry.name, []).append(entry)
+            for name in sorted(entries):
+                item, top = rel / name, entries[name][-1]
+                if top.is_dir():
+                    dir_layers = [e for e in entries[name] if e.is_dir()]
+                    if len(dir_layers) > 1 or (needs_real(item) and not is_link(top.path)):
+                        mirror(item)
                     else:
-                        self.link_dir(entry.path, app0 / item, mode)
+                        self.link_dir(top.path, app0 / item, mode)
                 elif item not in module_files:
-                    self.link_file(entry.path, app0 / item, mode)
+                    self.link_file(top.path, app0 / item, mode)
                 count += 1
                 if count % 200 == 0:
                     self.progress(f"Assembling app0: {count} items")
 
-        mirror(root, Path("."))
+        mirror(Path("."))
 
     # ---- relinker
 
@@ -483,25 +502,55 @@ class Converter:
         mode = c.link_mode if c.link_mode != "auto" else ("link" if target_os == system else "copy")
 
         eboot, root = self.locate_game()
-        title_id, title_name = self.read_title(root)
-        self.log(f"Game: {title_name or '?'} ({title_id or '?'})  -  {root}")
+        title_id, title_name, version = self.read_param(root)
+        if title_id is None:
+            self.log("WARNING: sce_sys/param.json is missing - some games need it at startup.")
+        self.log(f"Game: {title_name or '?'} ({title_id or '?'}), version {version or '?'}  -  {root}")
+        layers = [root]
+        patch = self.locate_patch()
+        if patch:
+            if patch == root or is_inside(patch, root) or is_inside(root, patch):
+                raise ConvertError("The patch folder must be separate from the game folder.")
+            patch_id, patch_name, patch_version = self.read_param(patch)
+            if patch_id and title_id and patch_id != title_id and not c.force:
+                raise ConvertError(f"The patch is for {patch_id}, but the game is {title_id}. Use --force to apply it anyway.")
+            self.log(f"Patch: version {patch_version or '?'}  -  {patch}")
+            if (patch / eboot.name).is_file():
+                eboot = (patch / eboot.name).resolve()
+                if magic_of(eboot) is None:
+                    raise ConvertError(f"The patch {eboot.name} is neither an ELF nor a SELF file.")
+            else:
+                self.log(f"WARNING: the patch has no {eboot.name} - the base game executable is used, "
+                         "which usually does not match patched data.")
+            title_id, title_name = patch_id or title_id, patch_name or title_name
+            layers.append(patch)
         cpu_name, _ = cpu_info()
         self.log(f"Host: {system}, CPU: {cpu_name}  ->  target: {target_os}, CPU mode: {cpu}, app0: {mode}")
 
         base = re.sub(r"[^A-Za-z0-9_-]+", "", (title_name or "").title()) or title_id or "game"
         output = Path(c.output).expanduser() if c.output else root.parent / f"{root.name}_{target_os}"
         output = output.resolve()
-        if is_inside(output, root) or is_inside(root, output):
-            raise ConvertError("The output folder cannot be inside the game folder (or vice versa).")
+        for layer in layers:
+            if is_inside(output, layer) or is_inside(layer, output):
+                raise ConvertError("The output folder cannot be inside the game or patch folder (or vice versa).")
         exe_name = base + {"windows": ".exe", "linux": ".elf", "macos": ""}[target_os]
 
-        modules, found_executables = self.scan(root, eboot)
+        modules, found_executables = self.scan(layers, eboot.name)
         extra_dirs = [rel for rel in modules if rel not in AUTO_MODULE_DIRS]
         self.log("Modules: " + (", ".join(f"{rel}/ ({len(n)})" for rel, n in modules.items()) or "none"))
-        executables = list(c.executables)
+        if patch:
+            patched = sum(1 for files in modules.values() for path in files.values() if is_inside(path, patch))
+            self.log(f"  {patched} module(s) taken from the patch")
+        executables = {}
+        for rel in c.executables:
+            source = next((layer / rel for layer in reversed(layers) if (layer / rel).is_file()), None)
+            if source is None:
+                raise ConvertError(f"Executable not found: {rel}")
+            executables[rel] = source
         if found_executables:
             if c.include_executables:
-                executables += [e for e in found_executables if e not in executables]
+                for rel, source in found_executables.items():
+                    executables.setdefault(rel, source)
             else:
                 self.log("Extra executables found (skipped; enable 'Include extra executables' if the game uses them): "
                          + ", ".join(found_executables))
@@ -526,17 +575,17 @@ class Converter:
         safe_remove(stage)
         self.log("Unwrapping executables ...")
         self.log(f"  eboot.bin: {self.unwrap(eboot, stage / 'eboot.elf')}")
-        for rel, names in modules.items():
-            for name in names:
+        for rel, files in modules.items():
+            for name, source in files.items():
                 self.progress(f"Unwrapping {rel}/{name}")
-                kind = self.unwrap(root / rel / name, stage / rel / name)
+                kind = self.unwrap(source, stage / rel / name)
                 if c.verbose:
                     self.log(f"  {rel}/{name}: {kind}")
-        for rel in executables:
-            self.unwrap(root / rel, stage / rel)
+        for rel, source in executables.items():
+            self.unwrap(source, stage / rel)
 
         self.log(f"Assembling app0 ({'links' if mode == 'link' else 'copying - this may take a while'}) ...")
-        self.build_app0(root, output / "app0", modules, mode)
+        self.build_app0(layers, output / "app0", modules, mode)
 
         command = [str(relinker)]
         command += {"windows": ["--windows"], "linux": [], "macos": ["--macos"]}[target_os]
@@ -567,7 +616,8 @@ class Converter:
         if not c.keep_stage:
             safe_remove(stage)
         marker.write_text(json.dumps({
-            "tool": VERSION, "anyps5": tag, "game": str(root), "title": title_name, "titleId": title_id,
+            "tool": VERSION, "anyps5": tag, "game": str(root), "patch": str(patch) if patch else None,
+            "title": title_name, "titleId": title_id,
             "target_os": target_os, "cpu": cpu, "app0": mode, "outputs": outputs,
             "converted": time.strftime("%Y-%m-%d %H:%M:%S"),
         }, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -582,7 +632,7 @@ class Converter:
 
     def notes(self, target_os, mode):
         if mode == "link":
-            self.log("app0/ links to the original game files - do not delete or modify the source folder.")
+            self.log("app0/ links to the original game (and patch) files - do not delete or modify the source folders.")
         if target_os == "windows":
             self.log("Windows: the game needs a lot of virtual memory (RAM + page file).")
         elif target_os == "linux":
@@ -625,7 +675,7 @@ def run_gui():
 
     cpu_name, vendor = cpu_info()
     v = {
-        "game": tk.StringVar(), "output": tk.StringVar(), "os": tk.StringVar(value=host_os()),
+        "game": tk.StringVar(), "patch": tk.StringVar(), "output": tk.StringVar(), "os": tk.StringVar(value=host_os()),
         "cpu": tk.StringVar(value="auto"), "version": tk.StringVar(value="latest"),
         "link": tk.StringVar(value="auto"), "run": tk.BooleanVar(), "gui": tk.BooleanVar(),
         "exes": tk.BooleanVar(), "relinker": tk.StringVar(), "libs": tk.StringVar(),
@@ -665,6 +715,7 @@ def run_gui():
 
     path_row("Game (folder / eboot.bin):", v["game"],
              [("Folder…", pick_dir(v["game"])), ("File…", pick_file(v["game"], [("eboot", "*.bin"), ("All files", "*")]))])
+    path_row("Patch (optional):", v["patch"], [("Folder…", pick_dir(v["patch"])), ("Clear", lambda: v["patch"].set(""))])
     path_row("Output folder:", v["output"], [("Folder…", pick_dir(v["output"]))])
 
     def combo_row(label, var, values, hint=""):
@@ -739,7 +790,7 @@ def run_gui():
         if not v["game"].get().strip():
             messagebox.showwarning("No game", "Select the game folder or the eboot.bin file.")
             return
-        config = Config(game=v["game"].get().strip(), output=v["output"].get().strip(), target_os=v["os"].get(),
+        config = Config(game=v["game"].get().strip(), patch=v["patch"].get().strip(), output=v["output"].get().strip(), target_os=v["os"].get(),
                         cpu=v["cpu"].get(), version=v["version"].get(), link_mode=v["link"].get(),
                         run_after=v["run"].get(), windows_gui=v["gui"].get(), include_executables=v["exes"].get(),
                         relinker=v["relinker"].get().strip(), libs=v["libs"].get().strip(), verbose=v["verbose"].get())
@@ -781,6 +832,7 @@ def main(argv=None):
             return 1
     parser = argparse.ArgumentParser(description="Convert a PS5 game into a native program with AnyPS5.")
     parser.add_argument("game", help="game folder (with eboot.bin) or the eboot.bin file")
+    parser.add_argument("--patch", default="", help="folder with a decrypted game update (patch) to apply on top")
     parser.add_argument("-o", "--output", default="", help="output folder (default <game folder>_<os>)")
     parser.add_argument("--os", dest="target_os", choices=OS_CHOICES, default="", help="target OS (default: this one)")
     parser.add_argument("--cpu", choices=CPU_CHOICES, default="auto", help="target CPU (default: detected)")
@@ -797,7 +849,7 @@ def main(argv=None):
     parser.add_argument("--keep-stage", action="store_true", help="keep unwrapped ELF files (.anyps5-stage)")
     parser.add_argument("-v", "--verbose", action="store_true", help="verbose log")
     args = parser.parse_args(argv)
-    config = Config(game=args.game, output=args.output, target_os=args.target_os, cpu=args.cpu, version=args.version,
+    config = Config(game=args.game, patch=args.patch, output=args.output, target_os=args.target_os, cpu=args.cpu, version=args.version,
                     link_mode=args.link_mode, run_after=args.run, windows_gui=args.windows_gui,
                     include_executables=args.include_executables, relinker=args.relinker, libs=args.libs,
                     executables=args.executable, extra_args=args.extra, force=args.force,
